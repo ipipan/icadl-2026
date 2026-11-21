@@ -1,0 +1,42 @@
+# secrets
+.env
+
+# AnythingLLM runtime storage (vector DB indices, uploaded docs, sqlite)
+storage/
+
+# Downloaded models and HF caches (large files)
+models/
+cache/
+
+# Docker volumes (if accidentally materialised locally)
+qdrant_data/
+hf_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# local data (not versioned)
+/data/
+
+# only README.md files are versioned among Markdown files
+*.md
+!README.md
+
+# not part of the published solution (kept locally)
+/rebuttal/
+/notebooks/
+/docs/
+.claude/
+# evaluation scripts, question sets and results (not needed to run the system)
+/scripts/eval_results/
+/scripts/eval_*.py
+/scripts/eval_questions*.json
+/scripts/build_*.py

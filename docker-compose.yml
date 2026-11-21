@@ -1,0 +1,445 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+    volumes:
+      - ./storage/qdrant:/qdrant/storage
+
+  # vLLM: OpenAI-compatible LLM server -- two profile-gated variants below,
+  # both reachable at hostname "vllm" (via network alias) so AnythingLLM's
+  # config never changes when switching between them. Only run one at a time:
+  #   docker compose --profile bnb up -d        # raw bf16 checkpoints
+  #   docker compose --profile prequant up -d   # pre-quantized (FP8/AWQ/GPTQ)
+  # NOTE: plain `docker compose up` (no --profile) starts NEITHER vllm variant.
+
+  # On-the-fly BitsAndBytes 4-bit quantization -- for raw bf16/fp16 checkpoints
+  # (e.g. Qwen3.6-27B, Qwen3.6-35B-A3B). First run downloads full-precision
+  # weights (large); cached in ./cache/huggingface on subsequent runs.
+  vllm-bnb:
+    image: vllm/vllm-openai:latest
+    profiles: ["bnb"]
+    restart: unless-stopped
+    ports:
+      - "${VLLM_PORT:-8000}:8000"
+    networks:
+      default:
+        aliases:
+          - vllm
+    volumes:
+      - ${HF_CACHE_DIR:-./cache/huggingface}:/root/.cache/huggingface
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      # See the matching comment on vllm-prequant below -- same fix.
+      - VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120
+    command:
+      - "${VLLM_MODEL:-Qwen/Qwen3.5-4B}"
+      - "--served-model-name"
+      - "local-model"
+      - "--api-key"
+      - "${VLLM_API_KEY:-token-abc123}"
+      - "--quantization"
+      - "bitsandbytes"
+      - "--load-format"
+      - "bitsandbytes"
+      - "--gpu-memory-utilization"
+      - "${VLLM_GPU_MEM:-0.85}"
+      - "--max-model-len"
+      - "${VLLM_MAX_LEN:-32768}"
+      - "--enforce-eager"
+      # Thinking OFF. This model's reasoning is unbounded — on real queries it
+      # never closes </think> within the token budget, yielding an empty answer
+      # (finish=length, content=null). Rep/presence/freq penalties do NOT fix it
+      # (tested). A reasoning-parser makes it worse (routes all output to
+      # `reasoning`, leaves content=null). enable_thinking=false = reliable,
+      # bounded, always-an-answer. AnythingLLM cannot send this kwarg itself.
+      - "--default-chat-template-kwargs"
+      - '{"enable_thinking": false}'
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "qwen3_xml"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${VLLM_GPU_DEVICE:-1}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 600s
+
+  # Pre-quantized checkpoints (FP8/AWQ/GPTQ, e.g. Qwen3.6-35B-A3B-FP8) -- vLLM
+  # auto-detects the quantization method from the checkpoint's own config, so
+  # no --quantization/--load-format flags (passing bitsandbytes here would
+  # conflict with weights that are already quantized). Roughly half the
+  # download size of the equivalent bf16 checkpoint.
+  vllm-prequant:
+    image: vllm/vllm-openai:latest
+    profiles: ["prequant"]
+    restart: unless-stopped
+    ports:
+      - "${VLLM_PORT:-8000}:8000"
+    networks:
+      default:
+        aliases:
+          - vllm
+    volumes:
+      - ${HF_CACHE_DIR:-./cache/huggingface}:/root/.cache/huggingface
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      # vLLM's uvicorn server defaults this to 5s. Our CPU-bound reranking
+      # step (NativeEmbeddingReranker, patches/anythingllm/qdrant-index.js)
+      # blocks Node's event loop for 5-8s between the rag-memory tool call
+      # and the follow-up completion request -- if reranking takes longer
+      # than this, vLLM closes the idle keep-alive connection, and the
+      # agent's next request reuses a dead socket and fails instantly with
+      # "Connection error" (confirmed via matching timestamps in AnythingLLM
+      # logs: reranking finishes, completion request fires <10ms later,
+      # immediate connection error from OpenAI.makeRequest). Not a GPU/memory
+      # setting -- safe to raise freely.
+      - VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120
+    command:
+      - "${VLLM_MODEL:-Qwen/Qwen3.5-4B}"
+      - "--served-model-name"
+      - "local-model"
+      - "--api-key"
+      - "${VLLM_API_KEY:-token-abc123}"
+      - "--gpu-memory-utilization"
+      - "${VLLM_GPU_MEM:-0.85}"
+      - "--max-model-len"
+      - "${VLLM_MAX_LEN:-32768}"
+      # enforce-eager removed -- was disabling CUDA graph capture, observed
+      # at only ~14% GPU utilization during decode and ~13-14 tok/s on this
+      # MoE model (Qwen3.6-35B-A3B, ~3B active params/token -- should be much
+      # faster on an H100). This model has hybrid Mamba/attention layers;
+      # CUDA graph capture needs one Mamba cache block per concurrent
+      # sequence, and the default max_num_seqs=1024 needs more blocks than
+      # fit in the existing VLLM_GPU_MEM budget (758 available at 0.6) --
+      # NOT a general OOM, just this specific accounting. Fixed by lowering
+      # max_num_seqs to match actual expected concurrency (a handful of
+      # RAG chat users, not 1024) rather than raising gpu_memory_utilization.
+      - "--max-num-seqs"
+      - "32"
+      # Thinking OFF -- tried ON (Qwen3.6-35B-A3B-FP8), reverted for good
+      # this time. Simple agent-mode questions worked well (fast, correct,
+      # grounded), which is why it was initially kept on. But real GUI usage
+      # then hit the same "unbounded reasoning" bug documented for
+      # Qwen3.5-4B on vllm-bnb: a follow-up requiring 2 search rounds (80
+      # combined chunks, comparing many candidate years for "najnowszy
+      # dokument") burned the entire GENERIC_OPEN_AI_MAX_TOKENS budget
+      # (8192) on reasoning alone, never closed </think>, and returned a
+      # hard EMPTY answer -- worse than a wrong answer, and on exactly the
+      # kind of complex multi-hop question reasoning was meant to help
+      # with. Confirmed not a one-off: simple questions pass, complex
+      # multi-round ones can silently fail completely. Not worth the risk
+      # for this model/workload -- do not re-enable without a fix for this
+      # specific unbounded-reasoning failure mode (e.g. a hard reasoning
+      # token budget separate from the answer budget, if vLLM adds one).
+      - "--default-chat-template-kwargs"
+      - '{"enable_thinking": false}'
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "qwen3_xml"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${VLLM_GPU_DEVICE:-1}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 600s
+
+  # TEI: fast local embeddings (BAAI/bge-m3 — strong multilingual, good for Polish)
+  # `latest` is compiled for compute cap 8.0 (Ampere) and fails on other GPUs
+  # with "Runtime compute cap X is not compatible with compile time compute cap 80".
+  # Pick the tag matching your GPU: turing-1.5 (7.5), 86-1.5 (Ampere 8.6),
+  # 89-1.5 (Ada Lovelace), hopper-latest (Hopper, e.g. H100), 100-1.5/120-1.5 (Blackwell)
+  # For CPU-only: use image ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+  #               and remove the deploy block below
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:hopper-latest
+    restart: unless-stopped
+    ports:
+      - "${TEI_PORT:-8001}:80"
+    volumes:
+      - ./cache/tei:/data
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    command:
+      - "--model-id"
+      - "${EMBED_MODEL:-BAAI/bge-m3}"
+      - "--port"
+      - "80"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            # Pinned to the SAME GPU as vLLM (was previously unpinned --
+            # `count: 1` with no device_ids let it default to GPU 0 even
+            # while vLLM ran on VLLM_GPU_DEVICE, splitting one logical stack
+            # across two cards). bge-m3 is small (~2GB), so it comfortably
+            # co-resides with vLLM's reduced memory budget below.
+            - driver: nvidia
+              device_ids: ["${VLLM_GPU_DEVICE:-1}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 600s
+
+  # GPU reranker for the qdrant provider patch (patches/anythingllm/qdrant-index.js).
+  # AnythingLLM's own bundled reranker (NativeEmbeddingReranker, transformers.js)
+  # is CPU/WASM-only -- no CUDA execution provider -- and took 5-8s per query,
+  # which was long enough to trip vLLM's 5s keep-alive timeout and cause
+  # intermittent "Connection error" failures in agent mode (see
+  # VLLM_HTTP_TIMEOUT_KEEP_ALIVE below for that fix too). TEI natively
+  # supports cross-encoder rerank models on GPU via /rerank. bge-reranker-v2-m3
+  # is also a better fit than the bundled ms-marco-MiniLM-L-6-v2, which is
+  # English-only -- ours is multilingual/Polish-capable.
+  tei-rerank:
+    image: ghcr.io/huggingface/text-embeddings-inference:hopper-latest
+    restart: unless-stopped
+    ports:
+      - "${TEI_RERANK_PORT:-8025}:80"
+    volumes:
+      - ./cache/tei-rerank:/data
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    command:
+      - "--model-id"
+      - "${RERANK_MODEL:-BAAI/bge-reranker-v2-m3}"
+      - "--port"
+      - "80"
+      # Default is 32 -- our rerank pool (CBDU_RERANK_POOL_SIZE, .env,
+      # default 200) sends that many candidates in one /rerank call.
+      - "--max-client-batch-size"
+      - "256"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${VLLM_GPU_DEVICE:-1}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 600s
+
+  anythingllm:
+    # Pinned by digest, not a version tag -- the "1.15.0" tag on the registry
+    # was checked directly and turned out to be a DIFFERENT build than what
+    # "latest" had already pulled here (different image ID entirely, despite
+    # this container's own package.json also self-reporting "1.15.0" --
+    # "latest" tracks a moving development branch, tags don't necessarily
+    # match 1:1 with what shipped under a version number at any given time).
+    # This pins to the EXACT image already running, byte for byte. This
+    # matters specifically because of the patches/anythingllm/assets/*.js
+    # mounts below -- those are keyed to THIS build's content-hashed
+    # filenames; any image change (even a "matching" version tag) can
+    # silently break every one of those mounts. To intentionally upgrade,
+    # pull the new image, re-run the asset extraction/translation pass, and
+    # update this digest deliberately -- never let it drift via `latest`.
+    image: mintplexlabs/anythingllm@sha256:0a20d9e8feb04b5fdd2c87d0383e0392dbac32355706864badef900f5e626f97
+    restart: unless-stopped
+    ports:
+      - "${ANYTHINGLLM_PORT:-3001}:3001"
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - ./storage:/app/server/storage
+      - ./data:/app/data:ro
+      - ./scripts:/app/scripts:ro
+      # Forces agent mode's first tool call after each user message to be
+      # rag-memory (search) instead of leaving tool_choice at the upstream
+      # default "auto" -- AnythingLLM never sets tool_choice anywhere in its
+      # own code, so the agent could (and did, in testing) skip searching on
+      # follow-up questions and answer from recalled conversation instead.
+      # See patches/anythingllm/tooled.js for the diff/comments. Mounted
+      # read-only over the stock file so it survives container recreation
+      # without needing a custom-built image; re-diff against upstream after
+      # any AnythingLLM version bump in case the file has moved/changed.
+      - ./patches/anythingllm/tooled.js:/app/server/utils/agents/aibitat/providers/helpers/tooled.js:ro
+      # Suppresses the agent's intermediate thinking/status stream from
+      # being rendered as visible chat messages. This turned out to be
+      # THREE separate, independently-emitted message sources (found by
+      # testing live in the GUI after the first fix alone didn't fully
+      # silence it -- each needed its own patch):
+      #   1. "@agent is executing `rag-memory`...", "Found N additional
+      #      piece of context...", "Tool use completed." -- sent via
+      #      aibitat.introspect() as "statusResponse" socket messages, gated
+      #      by the websocket plugin's `introspection` option (upstream:
+      #      true). See patches/anythingllm/agents-index.js.
+      #   2. "Assembling Tool Call: name(args)" -- a separate
+      #      "toolCallInvocation" stream event, NOT gated by the flag above.
+      #      See patches/anythingllm/tooled.js (same file as the forced
+      #      tool_choice patch).
+      #   3. "@agent: Swapping over to agent chat..." -- a hardcoded
+      #      "statusResponse" HTTP chunk sent by the chat-routing layer
+      #      before the agent cluster/websocket even exists, also not gated
+      #      by (1). See patches/anythingllm/agents-chats-index.js.
+      # None of these affect the final answer ("textResponse") or hard
+      # failures ("wssFailure"), which use separate, unaffected channels.
+      - ./patches/anythingllm/agents-index.js:/app/server/utils/agents/index.js:ro
+      - ./patches/anythingllm/agents-chats-index.js:/app/server/utils/chats/agents.js:ro
+      # Collector forces every ingested doc's "title" metadata field through
+      # stripAndSlug(title) + ".txt", which is what the frontend citation
+      # header displays for our chunkSource prefix -- patch removes the
+      # slugify/suffix so citations show the real title instead of a
+      # filename-looking slug. See patches/anythingllm/processRawText-index.js.
+      - ./patches/anythingllm/processRawText-index.js:/app/collector/processRawText/index.js:ro
+      # New threads' default name was hardcoded "Thread" (English) -- never
+      # localized at all, unlike everything else which at least goes through
+      # the (mistranslatable) i18next system. Only affects newly-created
+      # threads (see the patch file's comment on the rename-eligibility
+      # check this interacts with).
+      - ./patches/anythingllm/workspaceThread-model.js:/app/server/models/workspaceThread.js:ro
+      # Polish (pl) locale fixes -- upstream AnythingLLM mistranslations, not
+      # ours to fix at the source. This is the full bundled locales file (all
+      # languages, built by AnythingLLM's frontend build) with only the
+      # Polish object's strings swapped -- re-diff after any AnythingLLM
+      # version bump. Fixes so far:
+      #   - similarity_match: "mecz" (sports match) -> "dopasowanie"
+      #   - chat.mode.automatic.title / agent_flows / clarifying_skipped:
+      #     "Agencja"/"agencji" (business agency) -> "Agent"/"agenta" (the
+      #     AI agent concept) -- wrong word entirely, and this IS our
+      #     default chat mode's displayed name
+      #   - model_wants_to_call: "zadzwonić" (phone-dial) -> "wywołać"
+      #     (invoke) -- a tool/function call mistranslated as a phone call
+      #   - placeholder_description: was describing what to type instead of
+      #     showing an example value matching the English placeholder text
+      #   - approve/reject/publish/remove-condition: infinitive verb forms
+      #     ("Zaakceptować") swapped to imperative ("Zaakceptuj") for
+      #     consistency with every other button label in the UI
+      #   - login reset / gmail markRead.title: were left untranslated
+      #     ("Reset", "Mark Read")
+      - ./patches/anythingllm/locales-index.js:/app/server/public/index.js:ro
+      # Admin/settings UI strings that AnythingLLM never wired to i18next at
+      # all (found the same way as the "New Thread" bug above: plain
+      # `children:"English text"` JSX literals, not translation keys -- so
+      # they show up in English regardless of selected language, in every
+      # locale, not just Polish). 32 of AnythingLLM's ~80 hashed frontend
+      # asset chunks contain at least one such string (412 total string
+      # occurrences, 312 distinct phrases) across vector-DB provider
+      # settings, agent flow builder, TTS/STT config, community hub, user
+      # management, etc. -- essentially the whole admin console, not the
+      # small handful visible from the plain chat window.
+      #
+      # CAUTION: unlike locales-index.js (a fixed path,
+      # /app/server/public/index.js), these are content-hashed filenames
+      # tied to the CURRENT frontend build -- any AnythingLLM version bump
+      # changes every hash, silently breaking every mount below (the host
+      # file would no longer match any real file in the new image; compose
+      # would either skip the stale mount or, depending on setup, mount an
+      # empty/wrong file over a path that doesn't need it). After any
+      # version bump: re-run the extraction (grep the new asset files for
+      # `children:"[A-Z]...` patterns not present in patches/anythingllm/
+      # translations.py's set of already-fixed English phrases) rather than
+      # assuming these paths still apply.
+      - ./patches/anythingllm/assets/index-026f56ac.js:/app/server/public/assets/index-026f56ac.js:ro
+      - ./patches/anythingllm/assets/index-04e9cda8.js:/app/server/public/assets/index-04e9cda8.js:ro
+      - ./patches/anythingllm/assets/index-13b96cf6.js:/app/server/public/assets/index-13b96cf6.js:ro
+      - ./patches/anythingllm/assets/index-19886dde.js:/app/server/public/assets/index-19886dde.js:ro
+      - ./patches/anythingllm/assets/index-1d0a6799.js:/app/server/public/assets/index-1d0a6799.js:ro
+      - ./patches/anythingllm/assets/index-262fb1fa.js:/app/server/public/assets/index-262fb1fa.js:ro
+      - ./patches/anythingllm/assets/index-2fd83061.js:/app/server/public/assets/index-2fd83061.js:ro
+      - ./patches/anythingllm/assets/index-3924209d.js:/app/server/public/assets/index-3924209d.js:ro
+      - ./patches/anythingllm/assets/index-3ff9c0eb.js:/app/server/public/assets/index-3ff9c0eb.js:ro
+      - ./patches/anythingllm/assets/index-530dd0fd.js:/app/server/public/assets/index-530dd0fd.js:ro
+      - ./patches/anythingllm/assets/index-67c3851b.js:/app/server/public/assets/index-67c3851b.js:ro
+      - ./patches/anythingllm/assets/index-6c33cd4c.js:/app/server/public/assets/index-6c33cd4c.js:ro
+      - ./patches/anythingllm/assets/index-6e647014.js:/app/server/public/assets/index-6e647014.js:ro
+      - ./patches/anythingllm/assets/index-7b59c303.js:/app/server/public/assets/index-7b59c303.js:ro
+      - ./patches/anythingllm/assets/index-7e9de449.js:/app/server/public/assets/index-7e9de449.js:ro
+      - ./patches/anythingllm/assets/index-837868b3.js:/app/server/public/assets/index-837868b3.js:ro
+      - ./patches/anythingllm/assets/index-9416191c.js:/app/server/public/assets/index-9416191c.js:ro
+      - ./patches/anythingllm/assets/index-99697652.js:/app/server/public/assets/index-99697652.js:ro
+      - ./patches/anythingllm/assets/index-a1d9fe1e.js:/app/server/public/assets/index-a1d9fe1e.js:ro
+      - ./patches/anythingllm/assets/index-a43cd816.js:/app/server/public/assets/index-a43cd816.js:ro
+      - ./patches/anythingllm/assets/index-b0c19edc.js:/app/server/public/assets/index-b0c19edc.js:ro
+      - ./patches/anythingllm/assets/index-b6a15d58.js:/app/server/public/assets/index-b6a15d58.js:ro
+      - ./patches/anythingllm/assets/index-bc1e0acb.js:/app/server/public/assets/index-bc1e0acb.js:ro
+      - ./patches/anythingllm/assets/index-c765443e.js:/app/server/public/assets/index-c765443e.js:ro
+      - ./patches/anythingllm/assets/index-cad0d8e7.js:/app/server/public/assets/index-cad0d8e7.js:ro
+      - ./patches/anythingllm/assets/index-cf152c06.js:/app/server/public/assets/index-cf152c06.js:ro
+      - ./patches/anythingllm/assets/index-e7cc597d.js:/app/server/public/assets/index-e7cc597d.js:ro
+      - ./patches/anythingllm/assets/index-eb00a80c.js:/app/server/public/assets/index-eb00a80c.js:ro
+      - ./patches/anythingllm/assets/index-f313e9ff.js:/app/server/public/assets/index-f313e9ff.js:ro
+      - ./patches/anythingllm/assets/index-f88d6f32.js:/app/server/public/assets/index-f88d6f32.js:ro
+      - ./patches/anythingllm/assets/index-f94813a9.js:/app/server/public/assets/index-f94813a9.js:ro
+      - ./patches/anythingllm/assets/mcpServers-5e1245f5.js:/app/server/public/assets/mcpServers-5e1245f5.js:ro
+      # Adds reranking support to the Qdrant provider (upstream only wires
+      # AnythingLLM's bundled NativeEmbeddingReranker into LanceDB). See
+      # patches/anythingllm/qdrant-index.js -- mirrors LanceDB's
+      # rerankedSimilarityResponse. Paired with workspace.vectorSearchMode
+      # = "rerank" (set in ingest.py).
+      - ./patches/anythingllm/qdrant-index.js:/app/server/utils/vectorDbProviders/qdrant/index.js:ro
+    environment:
+      - CBDU_RERANK_ENDPOINT=http://tei-rerank:80/rerank
+    env_file:
+      - .env
+    depends_on:
+      # Exactly one of these two is actually running (whichever --profile was
+      # used); required:false lets compose proceed with just the active one.
+      vllm-bnb:
+        condition: service_healthy
+        required: false
+      vllm-prequant:
+        condition: service_healthy
+        required: false
+      tei:
+        condition: service_healthy
+      tei-rerank:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/api/ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # One-shot ingest. Behind the "ingest" profile so `docker compose up` does NOT
+  # run it automatically. No manual API-key setup needed -- ingest.py's
+  # ensure_api_key() auto-provisions one from AUTH_TOKEN on first run and
+  # writes it back to .env (mounted read-write below) for host-side tools
+  # (eval_workspace.py etc). Run:
+  #   docker compose run --rm ingest
+  # Safe to re-run — AnythingLLM deduplicates by content hash.
+  ingest:
+    image: python:3.12-slim
+    profiles: ["ingest"]
+    restart: "no"
+    volumes:
+      - ./data:/app/data:ro
+      - ./scripts:/app/scripts:ro
+      - ./.env:/app/.env
+    env_file:
+      - .env
+    environment:
+      - ANYTHINGLLM_URL=http://anythingllm:3001
+      - DATA_FILE=/app/data/CBDU_ocr_gemini_pro_2.5.json
+    command:
+      - sh
+      - -c
+      - "pip install -q requests && python3 /app/scripts/ingest.py"
+    depends_on:
+      anythingllm:
+        condition: service_healthy
